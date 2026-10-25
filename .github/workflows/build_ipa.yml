@@ -1,0 +1,54 @@
+name: Build NXNative IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      nsp_url:
+        description: 'URL de descarga directa de tu juego (.nsp) o ID de Google Drive'
+        required: true
+
+jobs:
+  build-ipa:
+    runs-on: macos-15
+    steps:
+      - name: Descargar código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar dependencias en macOS
+        run: |
+          brew install xcodegen zstd spirv-cross glslang
+          brew install --cask dotnet-sdk
+          pip3 install lz4 capstone fonttools backports.zstd gdown --break-system-packages
+
+      - name: Configurar prod.keys
+        env:
+          SECRET_KEYS: ${{ secrets.PROD_KEYS }}
+        run: |
+          mkdir -p ~/keys ~/Games/MiJuego
+          if [ -n "$SECRET_KEYS" ]; then
+            echo "$SECRET_KEYS" > ~/keys/prod.keys
+          elif [ -f "prod.keys" ]; then
+            cp prod.keys ~/keys/prod.keys
+          else
+            echo "Error: No se encontró prod.keys ni en Secrets ni en el repo"
+            exit 1
+          fi
+
+      - name: Descargar Juego (.nsp)
+        run: |
+          if [[ "${{ github.event.inputs.nsp_url }}" == *"drive.google.com"* ]]; then
+            gdown --fuzzy "${{ github.event.inputs.nsp_url }}" -O ~/Games/MiJuego/game.nsp
+          else
+            curl -L "${{ github.event.inputs.nsp_url }}" -o ~/Games/MiJuego/game.nsp
+          fi
+          ls -lh ~/Games/MiJuego/
+
+      - name: Compilar el archivo .ipa
+        run: |
+          python3 scripts/build_ipa_from_nsp.py ~/Games/MiJuego -k ~/keys/prod.keys
+
+      - name: Subir el .ipa listo para descargar
+        uses: actions/upload-artifact@v4
+        with:
+          name: Juego-iOS-IPA
+          path: ~/Games/MiJuego/*.ipa
