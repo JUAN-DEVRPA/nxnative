@@ -1,0 +1,41 @@
+name: Build NXNative IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      nsp_url:
+        description: 'URL de descarga directa de tu archivo .nsp'
+        required: true
+      keys_url:
+        description: 'URL de descarga directa de tu prod.keys'
+        required: true
+
+jobs:
+  build-ipa:
+    runs-on: macos-15 # Usa una Mac real en los servidores de GitHub
+    steps:
+      - name: Clonar nxnative
+        run: git clone https://github.com/seedds/nxnative.git
+
+      - name: Instalar dependencias de macOS
+        run: |
+          brew install xcodegen zstd spirv-cross glslang
+          brew install --cask dotnet-sdk
+          pip3 install lz4 capstone fonttools backports.zstd --break-system-packages
+
+      - name: Descargar Juego (.nsp) y prod.keys
+        run: |
+          mkdir -p ~/Games/MiJuego ~/keys
+          curl -L "${{ github.event.inputs.nsp_url }}" -o ~/Games/MiJuego/game.nsp
+          curl -L "${{ github.event.inputs.keys_url }}" -o ~/keys/prod.keys
+
+      - name: Compilar el archivo .ipa
+         working-directory: nxnative
+        run: |
+          python3 scripts/build_ipa_from_nsp.py ~/Games/MiJuego -k ~/keys/prod.keys
+
+      - name: Subir el .ipa terminado para descargar en el iPhone
+        uses: actions/upload-artifact@v4
+        with:
+          name: Juego-Compilado-IPA
+          path: ~/Games/MiJuego/*.ipa
