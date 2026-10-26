@@ -36,10 +36,17 @@ jobs:
 
       - name: Descargar el juego (.nsp)
         run: |
-          if [[ "${{ github.event.inputs.nsp_url }}" == *"drive.google.com"* ]]; then
-            python3 -m gdown --fuzzy "${{ github.event.inputs.nsp_url }}" -O ~/Games/MiJuego/game.nsp
+          URL="${{ github.event.inputs.nsp_url }}"
+          if [[ "$URL" == *"drive.google.com"* ]]; then
+            # Extrae el identificador del archivo automáticamente desde el link de Drive
+            DRIVE_ID=$(echo "$URL" | sed -n 's/.*\/d\/\([^\/]*\).*/\1/p')
+            if [ -n "$DRIVE_ID" ]; then
+              python3 -m gdown "$DRIVE_ID" -O ~/Games/MiJuego/game.nsp
+            else
+              python3 -m gdown "$URL" -O ~/Games/MiJuego/game.nsp
+            fi
           else
-            curl -L "${{ github.event.inputs.nsp_url }}" -o ~/Games/MiJuego/game.nsp
+            curl -L "$URL" -o ~/Games/MiJuego/game.nsp
           fi
           ls -lh ~/Games/MiJuego/
 
