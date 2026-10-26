@@ -45,18 +45,18 @@ env:
 
 jobs:
   build-ipa:
-    runs-on: macos-15
+    # macos-26: el proyecto exige iOS 26+ y su propio CI corre en este runner (Xcode 26 de serie).
+    runs-on: macos-26
     timeout-minutes: 300
 
     steps:
       - name: 1. Checkout del motor NXNative
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
+          persist-credentials: false
 
       - name: 2. Liberar disco, seleccionar Xcode y Preflight Fail-Fast
-        env:
-          TARGET_LANG: ${{ inputs.game_lang }}
         run: |
           set -euo pipefail
 
@@ -115,45 +115,32 @@ jobs:
           fi
           echo "::endgroup::"
 
-          echo "::group::Parcheo de compatibilidad según versión de Xcode"
+          echo "::group::Requisito de Xcode"
+          # El README del proyecto exige iOS/iPadOS 26+. Antes se parcheaban las APIs 'glass' y el
+          # target a 18.0 con sed con Xcode < 26: eso generaba un IPA no soportado, así que ahora falla.
           if [ "$XCODE_MAJOR" -lt 26 ]; then
-            DEPLOY_TARGET="18.0"
-            echo "::warning::Xcode $XCODE_MAJOR < 26: se reemplazan APIs 'glass' de iOS 26 y el deployment target pasa a 18.0."
-            find dm/ios/ -name "*.swift" -exec sed -i '' \
-              -e 's/\.buttonStyle(\.glassProminent)/.buttonStyle(.borderedProminent)/g' \
-              -e 's/\.buttonStyle(\.glass)/.buttonStyle(.bordered)/g' \
-              -e 's/\.glassProminent/.borderedProminent/g' {} +
-
-            find dm/ scripts/ -type f \( -name "*.yml" -o -name "*.py" -o -name "*.sh" \) \
-              -exec sed -i '' \
-              -e 's/iOS: "26\.0"/iOS: "18.0"/g' \
-              -e 's/iOS: 26\.0/iOS: 18.0/g' \
-              -e 's/IPHONEOS_DEPLOYMENT_TARGET=26\.0/IPHONEOS_DEPLOYMENT_TARGET=18.0/g' \
-              -e 's/iphoneos26\.0/iphoneos18.0/g' {} +
-          else
-            DEPLOY_TARGET="26.0"
-            echo "Xcode $XCODE_MAJOR >= 26: no se requieren parches."
-          fi
-
-          case "$TARGET_LANG" in
-            es-419|es|en-US) ;;
-            *) echo "::error::Idioma no soportado: '$TARGET_LANG'"; exit 1 ;;
-          esac
-          if [ "$TARGET_LANG" != "en-US" ]; then
-            find scripts/ -name "*.py" -exec sed -i '' "s/en-US/${TARGET_LANG}/g" {} +
-          fi
-          echo "::endgroup::"
-
-          echo "::group::Preflight Fail-Fast (Typecheck de SwiftUI)"
-          if [ ! -f dm/ios/Sources/Launcher.swift ]; then
-            echo "::error::Falta dm/ios/Sources/Launcher.swift en el repositorio."
+            echo "::error::NXNative necesita Xcode 26 o superior (activo: Xcode $XCODE_MAJOR). Usa un runner macos-26."
             exit 1
           fi
-          xcrun --sdk iphoneos swiftc -typecheck \
-            -target "arm64-apple-ios${DEPLOY_TARGET}" \
-            -sdk "$SDK_PATH" \
-            dm/ios/Sources/Launcher.swift
-          echo "✓ Validación estática de Swift superada en 0 errores."
+          echo "✓ Xcode $XCODE_MAJOR"
+          echo "::endgroup::"
+
+          echo "::group::Preflight Fail-Fast (fuentes iOS compiladas para el SDK de iPhone)"
+          if [ -f dm/ios/tools/compile_check.py ]; then
+            # Herramienta del propio proyecto (la usa su CI): compila todas las fuentes iOS sin firmar.
+            python3 dm/ios/tools/compile_check.py
+          else
+            echo "::warning::No existe dm/ios/tools/compile_check.py; se usa el typecheck de Launcher.swift."
+            if [ ! -f dm/ios/Sources/Launcher.swift ]; then
+              echo "::error::Falta dm/ios/Sources/Launcher.swift en el repositorio."
+              exit 1
+            fi
+            xcrun --sdk iphoneos swiftc -typecheck \
+              -target "arm64-apple-ios26.0" \
+              -sdk "$SDK_PATH" \
+              dm/ios/Sources/Launcher.swift
+          fi
+          echo "✓ Validación estática superada."
           echo "::endgroup::"
 
           wait
@@ -209,6 +196,11 @@ jobs:
           echo "$DOTNET_ROOT_RESOLVED" | sudo tee /etc/dotnet/install_location >/dev/null
           echo "✓ .NET registrado en: $DOTNET_ROOT_RESOLVED"
 
+      - name: 4b. Instalar Python 3.14
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'   # backports.zstd solo hace falta en Python < 3.14
+
       - name: 5. Instalar dependencias (Homebrew + Python)
         run: |
           set -euo pipefail
@@ -237,8 +229,7 @@ jobs:
             || { echo "::error::Falta glslang tras instalar."; exit 1; }
 
           retry python3 -m pip install --quiet --disable-pip-version-check \
-            lz4 capstone fonttools gdown "backports.zstd; python_version < '3.14'" \
-            --break-system-packages
+            lz4 capstone fonttools gdown
           python3 -c "import lz4, capstone, fontTools, gdown; print('✓ Módulos Python OK')"
 
       - name: 6. Validar criptografía (prod.keys)
@@ -348,18 +339,31 @@ jobs:
           if [ -n "$UPD_URL" ]; then
             echo "Descargando actualización (update)..."
             download_file "$UPD_URL" "$WORK_DIR/update_game.nsp"
-
-            BASE_SIZE=$(stat -f%z "$WORK_DIR/base_game.nsp")
-            UPD_SIZE=$(stat -f%z "$WORK_DIR/update_game.nsp")
-            if [ "$UPD_SIZE" -gt "$BASE_SIZE" ]; then
-              echo "::warning::El 'update' pesa más que el 'base': es probable que hayas intercambiado las URLs. Revisa los inputs."
-            fi
           fi
+          # Nota: el orden base/update no importa; el script detecta cuál es cuál por contenido
+          # y empaqueta la versión más nueva de la carpeta.
 
           ls -lh "$WORK_DIR"/*.nsp
-          df -h / | tail -n 1
+
+          # README del proyecto: espacio libre recomendado ≈ 2× el tamaño de los NSP + 10 GB.
+          NSP_KB=0
+          for f in "$WORK_DIR"/*.nsp; do
+            NSP_KB=$(( NSP_KB + $(stat -f%z "$f") / 1024 ))
+          done
+          FREE_KB=$(df -k "$WORK_DIR" | awk 'NR==2 {print $4}')
+          NEED_KB=$(( NSP_KB * 2 + 10 * 1024 * 1024 ))
+          MIN_KB=$(( NSP_KB + 10 * 1024 * 1024 ))
+          echo "Espacio libre: $(( FREE_KB / 1048576 )) GB · recomendado: $(( NEED_KB / 1048576 )) GB"
+          if [ "$FREE_KB" -lt "$MIN_KB" ]; then
+            echo "::error::Espacio insuficiente para el build ($(( FREE_KB / 1048576 )) GB libres, mínimo razonable $(( MIN_KB / 1048576 )) GB)."
+            exit 1
+          elif [ "$FREE_KB" -lt "$NEED_KB" ]; then
+            echo "::warning::Espacio justo: el proyecto recomienda ~$(( NEED_KB / 1048576 )) GB libres y hay $(( FREE_KB / 1048576 )) GB."
+          fi
 
       - name: 9. Recompilación AOT, shaders Metal y empaquetado IPA
+        env:
+          GAME_LANG: ${{ inputs.game_lang }}
         run: |
           set -uo pipefail
 
@@ -367,7 +371,9 @@ jobs:
           dotnet --list-runtimes
           cat /etc/dotnet/install_location_arm64
 
-          if ! python3 scripts/build_ipa_from_nsp.py "$WORK_DIR" -k "$KEYS_DIR/prod.keys"; then
+          # Idioma con la opción oficial -l/--language del script (ya no se parchean los .py con sed).
+          # Si el juego no tiene ese idioma, el script imprime los disponibles y se detiene.
+          if ! python3 scripts/build_ipa_from_nsp.py "$WORK_DIR" -k "$KEYS_DIR/prod.keys" -l "$GAME_LANG"; then
             echo "::error::Fallo en la tubería de compilación. Volcando trazas disponibles:"
             find "$WORK_DIR" -name "*.log" -exec echo "--- {} ---" \; -exec tail -n 80 {} \; || true
             exit 1
@@ -401,9 +407,18 @@ jobs:
             /Users/runner/Games/MiJuego/*_build/profile
           key: nxnative-metal-v2-${{ hashFiles('scripts/**', 'dm/**') }}-${{ github.run_id }}
 
+      - name: 10c. Subir logs del build si falla
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-nxnative-build
+          path: /Users/runner/Games/MiJuego/*_build/logs/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: 11. Publicar IPA
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: SuperMarioOdyssey-iPhone17-IPA
           path: /Users/runner/Games/MiJuego/*.ipa
