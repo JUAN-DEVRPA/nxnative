@@ -57,6 +57,467 @@ jobs:
           persist-credentials: false
 
       - name: 2. Liberar disco, seleccionar Xcode y Preflight Fail-Fast
+        env:
+          # compile_check.py exige un perfil de juego base (GAME o DM_GAME). Para compilar el código
+          # sirve cualquier perfil existente en el repo; usamos el de Super Mario Odyssey.
+          GAME: "0100000000010000"
+        run: |
+          set -euo pipefail
+
+          echo "::group::Disco antes de limpiar"
+          df -h / | tail -n 1
+          echo "::endgroup::"
+
+          echo "::group::Selección de Xcode"
+          LATEST_XCODE=$(ls -d /Applications/Xcode_[0-9]*.app 2>/dev/null | grep -vi beta | sort -V | tail -n 1 || true)
+          if [ -z "$LATEST_XCODE" ]; then
+            LATEST_XCODE="/Applications/Xcode.app"
+          fi
+          if [ ! -d "$LATEST_XCODE" ]; then
+            echo "::error::No se encontró ningún Xcode en /Applications."
+            exit 1
+          fi
+          sudo xcode-select -s "$LATEST_XCODE"
+
+          # Capturar en variable: 'xcodebuild | grep -q' con pipefail da falsos
+          # negativos (SIGPIPE cuando grep cierra la tubería antes de tiempo).
+          XCODE_INFO=$(xcodebuild -version)
+          echo "$XCODE_INFO"
+          XCODE_MAJOR=$(awk '/^Xcode/ { split($2, v, "."); print v[1]; exit }' <<< "$XCODE_INFO")
+          if ! [[ "$XCODE_MAJOR" =~ ^[0-9]+$ ]]; then
+            echo "::error::No se pudo determinar la versión mayor de Xcode."
+            exit 1
+          fi
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          SDK_VER=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "✓ Xcode activo: $LATEST_XCODE (Xcode $XCODE_MAJOR, iOS SDK $SDK_VER)"
+          echo "::endgroup::"
+
+          echo "::group::Liberando espacio (Android SDK y Xcodes no usados)"
+          SELECTED_REAL=$(realpath "$LATEST_XCODE")
+          for app in /Applications/Xcode*.app; do
+            [ -e "$app" ] || continue
+            if [ "$(realpath "$app")" != "$SELECTED_REAL" ]; then
+              echo "Eliminando $app"
+              sudo rm -rf "$app" &
+            fi
+          done
+          rm -rf "$HOME/Library/Android" &
+          echo "::endgroup::"
+
+          echo "::group::Toolchain de Metal"
+          if ! xcrun --sdk iphoneos metal --version >/dev/null 2>&1; then
+            if [ "$XCODE_MAJOR" -ge 26 ]; then
+              echo "Metal Toolchain ausente: descargando componente..."
+              xcodebuild -downloadComponent MetalToolchain || true
+            fi
+          fi
+          if xcrun --sdk iphoneos metal --version >/dev/null 2>&1; then
+            xcrun --sdk iphoneos metal --version | head -n 1
+          else
+            echo "::warning::El compilador 'metal' no responde; la fase de shaders podría fallar."
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Requisito de Xcode"
+          # El README del proyecto exige iOS/iPadOS 26+. Antes se parcheaban las APIs 'glass' y el
+          # target a 18.0 con sed con Xcode < 26: eso generaba un IPA no soportado, así que ahora falla.
+          if [ "$XCODE_MAJOR" -lt 26 ]; then
+            echo "::error::NXNative necesita Xcode 26 o superior (activo: Xcode $XCODE_MAJOR). Usa un runner macos-26."
+            exit 1
+          fi
+          echo "✓ Xcode $XCODE_MAJOR"
+          echo "::endgroup::"
+
+          echo "::group::Preflight Fail-Fast (fuentes iOS compiladas para el SDK de iPhone)"
+          if [ -f dm/ios/tools/compile_check.py ]; then
+            # Herramienta del propio proyecto (la usa su CI): compila todas las fuentes iOS sin firmar.
+            python3 dm/ios/tools/compile_check.py
+          else
+            echo "::warning::No existe dm/ios/tools/compile_check.py; se usa el typecheck de Launcher.swift."
+            if [ ! -f dm/ios/Sources/Launcher.swift ]; then
+              echo "::error::Falta dm/ios/Sources/Launcher.swift en el repositorio."
+              exit 1
+            fi
+            xcrun --sdk iphoneos swiftc -typecheck \
+              -target "arm64-apple-ios26.0" \
+              -sdk "$SDK_PATH" \
+              dm/ios/Sources/Launcher.swift
+          fi
+          echo "✓ Validación estática superada."
+          echo "::endgroup::"
+
+          wait
+          echo "::group::Disco después de limpiar"
+          df -h / | tail -n 1
+          echo "::endgroup::"
+
+      - name: 3. Instalar .NET 10 (SDK + runtime)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: 4. Registrar .NET para apphosts (inmune a entornos limpios)
+        run: |
+          set -euo pipefail
+
+          DOTNET_BIN=$(command -v dotnet || true)
+          if [ -z "$DOTNET_BIN" ]; then
+            echo "::error::dotnet no está en el PATH tras setup-dotnet."
+            exit 1
+          fi
+          DOTNET_ROOT_RESOLVED=$(dirname "$(realpath "$DOTNET_BIN")")
+
+          if [ ! -d "$DOTNET_ROOT_RESOLVED/host/fxr" ]; then
+            echo "::error::'$DOTNET_ROOT_RESOLVED' no parece una raíz válida de .NET (falta host/fxr)."
+            exit 1
+          fi
+          if [[ "$(file -b "$DOTNET_ROOT_RESOLVED/dotnet")" != *arm64* ]]; then
+            echo "::error::El host de .NET no es arm64 y nx_extract es arm64."
+            file "$DOTNET_ROOT_RESOLVED/dotnet"
+            exit 1
+          fi
+
+          RUNTIMES=$(dotnet --list-runtimes)
+          echo "$RUNTIMES"
+          case "$RUNTIMES" in
+            *"Microsoft.NETCore.App 10."*) ;;
+            *) echo "::error::No hay runtime Microsoft.NETCore.App 10.x instalado."; exit 1 ;;
+          esac
+
+          # 1) Variables para los pasos siguientes
+          {
+            echo "DOTNET_ROOT=$DOTNET_ROOT_RESOLVED"
+            echo "DOTNET_ROOT_ARM64=$DOTNET_ROOT_RESOLVED"
+          } >> "$GITHUB_ENV"
+          echo "$DOTNET_ROOT_RESOLVED" >> "$GITHUB_PATH"
+
+          # 2) Ubicación registrada: el apphost la lee aunque el script Python
+          #    lance nx_extract con el entorno vacío (causa del error original:
+          #    "DOTNET_ROOT = <not set>").
+          sudo mkdir -p /etc/dotnet
+          echo "$DOTNET_ROOT_RESOLVED" | sudo tee /etc/dotnet/install_location_arm64 >/dev/null
+          echo "$DOTNET_ROOT_RESOLVED" | sudo tee /etc/dotnet/install_location >/dev/null
+          echo "✓ .NET registrado en: $DOTNET_ROOT_RESOLVED"
+
+      - name: 4b. Instalar Python 3.14
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'   # backports.zstd solo hace falta en Python < 3.14
+
+      - name: 5. Instalar dependencias (Homebrew + Python)
+        run: |
+          set -euo pipefail
+
+          retry() {
+            local n=0
+            until "$@"; do
+              n=$((n + 1))
+              if [ "$n" -ge 3 ]; then
+                echo "::error::Falló tras 3 intentos: $*"
+                return 1
+              fi
+              echo "Reintento $n de: $*"
+              sleep 5
+            done
+          }
+
+          for pkg in xcodegen spirv-cross glslang zstd; do
+            brew list --formula "$pkg" &>/dev/null || retry brew install --quiet "$pkg"
+          done
+
+          for tool in xcodegen spirv-cross zstd; do
+            command -v "$tool" >/dev/null || { echo "::error::Falta '$tool' tras instalar."; exit 1; }
+          done
+          command -v glslangValidator >/dev/null || command -v glslang >/dev/null \
+            || { echo "::error::Falta glslang tras instalar."; exit 1; }
+
+          retry python3 -m pip install --quiet --disable-pip-version-check \
+            lz4 capstone fonttools gdown
+          python3 -c "import lz4, capstone, fontTools, gdown; print('✓ Módulos Python OK')"
+
+      - name: 6. Validar criptografía (prod.keys)
+        env:
+          SECRET_KEYS: ${{ secrets.PROD_KEYS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$KEYS_DIR" "$WORK_DIR"
+
+          if [ -n "$SECRET_KEYS" ]; then
+            printf "%s\n" "$SECRET_KEYS" > "$KEYS_DIR/prod.keys"
+          elif [ -f "prod.keys" ]; then
+            echo "::warning::Usando prod.keys del repositorio. Muévelo al secret PROD_KEYS y elimínalo del historial."
+            cp prod.keys "$KEYS_DIR/prod.keys"
+          else
+            echo "::error::Falta prod.keys (ni en Secrets ni en el repo)."
+            exit 1
+          fi
+          tr -d '\r' < "$KEYS_DIR/prod.keys" > "$KEYS_DIR/prod.keys.clean"
+          mv "$KEYS_DIR/prod.keys.clean" "$KEYS_DIR/prod.keys"
+          chmod 600 "$KEYS_DIR/prod.keys"
+
+          for req_key in header_key aes_kek_generation_source key_area_key_application_00; do
+            if ! grep -Eq "^${req_key}[[:space:]]*=" "$KEYS_DIR/prod.keys"; then
+              echo "::error::prod.keys corrupto o incompleto: falta '$req_key'."
+              exit 1
+            fi
+          done
+          MASTER_COUNT=$(grep -Ec '^master_key_[0-9a-fA-F]{2}[[:space:]]*=' "$KEYS_DIR/prod.keys" || true)
+          if [ "${MASTER_COUNT:-0}" -eq 0 ]; then
+            echo "::warning::prod.keys no contiene ninguna master_key_XX; la extracción del update puede fallar."
+          fi
+          echo "✓ Criptografía validada (formato LF limpio, $MASTER_COUNT master keys)."
+
+      - name: 7. Restaurar caché multinivel (Shaders Metal + binarios rewritten)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /Users/runner/Games/MiJuego/*_build/shader
+            /Users/runner/Games/MiJuego/*_build/rewrite
+            /Users/runner/Games/MiJuego/*_build/profile
+          key: nxnative-metal-v2-${{ hashFiles('scripts/**', 'dm/**') }}-${{ github.run_id }}
+          restore-keys: |
+            nxnative-metal-v2-${{ hashFiles('scripts/**', 'dm/**') }}-
+            nxnative-metal-v2-
+            nxnative-cache-
+
+      - name: 8. Descarga segura de archivos .nsp
+        env:
+          BASE_URL: ${{ inputs.base_nsp_url }}
+          UPD_URL: ${{ inputs.update_nsp_url }}
+        run: |
+          set -euo pipefail
+
+          BASE_URL="${BASE_URL//[[:space:]]/}"
+          UPD_URL="${UPD_URL//[[:space:]]/}"
+
+          download_file() {
+            local url="$1" out="$2" attempt magic size
+
+            # Acepta también un ID de Drive "pelado"
+            if [[ "$url" =~ ^[A-Za-z0-9_-]{25,}$ ]]; then
+              url="https://drive.google.com/uc?id=${url}"
+            fi
+
+            for attempt in 1 2 3; do
+              rm -f "$out"
+              if [[ "$url" == *"google.com"* ]]; then
+                # --fuzzy entiende /d/ID, open?id=, uc?id=, usercontent, etc.
+                if python3 -m gdown --fuzzy "$url" -O "$out"; then break; fi
+              else
+                if curl -fL --retry 5 --retry-delay 5 --retry-all-errors "$url" -o "$out"; then break; fi
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "::error::No se pudo descargar $(basename "$out") tras 3 intentos (¿enlace privado o cuota de Drive excedida?)."
+                return 1
+              fi
+              echo "Intento $attempt falló; reintentando en 20 s..."
+              sleep 20
+            done
+
+            size=$(stat -f%z "$out")
+            if [ "$size" -lt 1048576 ]; then
+              echo "::error::$(basename "$out") pesa solo $size bytes: probablemente es una página HTML de error de Drive."
+              head -c 300 "$out" || true
+              return 1
+            fi
+
+            magic=$(xxd -p -l 4 "$out")
+            if [ "$magic" != "50465330" ]; then
+              echo "::error::El archivo descargado ($out) no es un contenedor .nsp válido (Magic: $magic)."
+              head -c 300 "$out" || true
+              return 1
+            fi
+            echo "✓ Archivo verificado: $(basename "$out") ($(du -h "$out" | cut -f1))"
+          }
+
+          if [ -z "$BASE_URL" ]; then
+            echo "::error::base_nsp_url está vacío."
+            exit 1
+          fi
+
+          echo "Descargando juego base..."
+          download_file "$BASE_URL" "$WORK_DIR/base_game.nsp"
+
+          if [ -n "$UPD_URL" ]; then
+            echo "Descargando actualización (update)..."
+            download_file "$UPD_URL" "$WORK_DIR/update_game.nsp"
+          fi
+          # Nota: el orden base/update no importa; el script detecta cuál es cuál por contenido
+          # y empaqueta la versión más nueva de la carpeta.
+
+          ls -lh "$WORK_DIR"/*.nsp
+
+          # README del proyecto: espacio libre recomendado ≈ 2× el tamaño de los NSP + 10 GB.
+          NSP_KB=0
+          for f in "$WORK_DIR"/*.nsp; do
+            NSP_KB=$(( NSP_KB + $(stat -f%z "$f") / 1024 ))
+          done
+          FREE_KB=$(df -k "$WORK_DIR" | awk 'NR==2 {print $4}')
+          NEED_KB=$(( NSP_KB * 2 + 10 * 1024 * 1024 ))
+          MIN_KB=$(( NSP_KB + 10 * 1024 * 1024 ))
+          echo "Espacio libre: $(( FREE_KB / 1048576 )) GB · recomendado: $(( NEED_KB / 1048576 )) GB"
+          if [ "$FREE_KB" -lt "$MIN_KB" ]; then
+            echo "::error::Espacio insuficiente para el build ($(( FREE_KB / 1048576 )) GB libres, mínimo razonable $(( MIN_KB / 1048576 )) GB)."
+            exit 1
+          elif [ "$FREE_KB" -lt "$NEED_KB" ]; then
+            echo "::warning::Espacio justo: el proyecto recomienda ~$(( NEED_KB / 1048576 )) GB libres y hay $(( FREE_KB / 1048576 )) GB."
+          fi
+
+      - name: 9. Recompilación AOT, shaders Metal y empaquetado IPA
+        env:
+          GAME_LANG: ${{ inputs.game_lang }}
+        run: |
+          set -uo pipefail
+
+          echo "DOTNET_ROOT=${DOTNET_ROOT:-<no definido>}"
+          dotnet --list-runtimes
+          cat /etc/dotnet/install_location_arm64
+
+          # Idioma con la opción oficial -l/--language del script (ya no se parchean los .py con sed).
+          # Si el juego no tiene ese idioma, el script imprime los disponibles y se detiene.
+          if ! python3 scripts/build_ipa_from_nsp.py "$WORK_DIR" -k "$KEYS_DIR/prod.keys" -l "$GAME_LANG"; then
+            echo "::error::Fallo en la tubería de compilación. Volcando trazas disponibles:"
+            find "$WORK_DIR" -name "*.log" -exec echo "--- {} ---" \; -exec tail -n 80 {} \; || true
+            exit 1
+          fi
+
+          if ! compgen -G "$WORK_DIR/*.ipa" >/dev/null; then
+            echo "::error::El script terminó sin error pero no generó ningún .ipa en $WORK_DIR."
+            exit 1
+          fi
+          rm -f "$WORK_DIR"/*.nsp
+
+      - name: 10a. Comprobar si hay caché que guardar
+        id: cache_check
+        if: always()
+        run: |
+          found=false
+          for d in shader rewrite profile; do
+            if compgen -G "$WORK_DIR/*_build/$d" >/dev/null; then
+              found=true
+            fi
+          done
+          echo "exists=$found" >> "$GITHUB_OUTPUT"
+
+      - name: 10b. Persistir caché de shaders Metal
+        if: always() && steps.cache_check.outputs.exists == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /Users/runner/Games/MiJuego/*_build/shader
+            /Users/runner/Games/MiJuego/*_build/rewrite
+            /Users/runner/Games/MiJuego/*_build/profile
+          key: nxnative-metal-v2-${{ hashFiles('scripts/**', 'dm/**') }}-${{ github.run_id }}
+
+      - name: 10c. Subir logs del build si falla
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-nxnative-build
+          path: /Users/runner/Games/MiJuego/*_build/logs/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: 11. Publicar IPA
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: SuperMarioOdyssey-iPhone17-IPA
+          path: /Users/runner/Games/MiJuego/*.ipa
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: 12. Resumen de telemetría del build
+        if: always()
+        env:
+          GAME_LANG: ${{ inputs.game_lang }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "## 📱 Reporte de Compilación NXNative (iPhone 17)"
+            if compgen -G "$WORK_DIR/*.ipa" >/dev/null; then
+              IPA_FILE=$(ls "$WORK_DIR"/*.ipa | head -n 1)
+              IPA_SIZE=$(du -h "$IPA_FILE" | cut -f1)
+              IPA_SHA=$(shasum -a 256 "$IPA_FILE" | cut -d' ' -f1)
+              echo "- **Estado:** ✅ Éxito total"
+              echo "- **Archivo generado:** \`$(basename "$IPA_FILE")\`"
+              echo "- **Tamaño final:** \`$IPA_SIZE\`"
+              echo "- **Idioma preconfigurado:** \`$GAME_LANG\`"
+              echo "- **SHA-256:** \`$IPA_SHA\`"
+            else
+              echo "- **Estado:** ❌ Falló o fue cancelado (\`$JOB_STATUS\`)"
+              echo "- **Revisa** el paso 9 para las trazas de \`nx_extract\` y del pipeline."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 13. Limpieza de llaves
+        if: always()
+        run: rm -rf "$KEYS_DIR"name: Build NXNative IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_nsp_url:
+        description: 'URL de Google Drive del Juego Base (.nsp)'
+        required: true
+        type: string
+      update_nsp_url:
+        description: '(Opcional) URL de Google Drive del Update (.nsp)'
+        required: false
+        type: string
+        default: ''
+      game_lang:
+        description: 'Idioma nativo preconfigurado en el .ipa'
+        required: true
+        type: choice
+        options:
+          - es-419
+          - es
+          - en-US
+        default: 'es-419'
+
+permissions:
+  contents: read
+
+# No cancelar un build de horas por un doble clic: el segundo queda en cola.
+concurrency:
+  group: nxnative-ipa-builder-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_ANALYTICS: 1
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: 1
+  PYTHONUNBUFFERED: 1
+  WORK_DIR: /Users/runner/Games/MiJuego
+  KEYS_DIR: /Users/runner/keys
+  # PATH y DOTNET_ROOT ya NO se fijan aquí: se resuelven dinámicamente
+  # (setup-dotnet + paso 4) para no pisar el PATH del runner.
+
+jobs:
+  build-ipa:
+    # macos-26: el proyecto exige iOS 26+ y su propio CI corre en este runner (Xcode 26 de serie).
+    runs-on: macos-26
+    timeout-minutes: 300
+
+    steps:
+      - name: 1. Checkout del motor NXNative
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 2. Liberar disco, seleccionar Xcode y Preflight Fail-Fast
+        env:
+          # compile_check.py exige un perfil de juego base (GAME o DM_GAME). Para compilar el código
+          # sirve cualquier perfil existente en el repo; usamos el de Super Mario Odyssey.
+          GAME: "0100000000010000"
         run: |
           set -euo pipefail
 
