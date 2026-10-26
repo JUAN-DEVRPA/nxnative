@@ -1,4 +1,4 @@
-name: Build NXNative IPA (Production Grade)
+name: Build NXNative IPA (Staff Engineer Edition)
 
 on:
   workflow_dispatch:
@@ -6,145 +6,224 @@ on:
       nsp_url:
         description: 'URL de Google Drive o enlace directo del archivo .nsp'
         required: true
-      game_lang:
-        description: 'Idioma por defecto del juego (ej. es-419, es, en-US)'
-        default: 'es-419'
+      update_nsp_url:
+        description: '(Opcional) URL del Update .nsp (ej. v1.4.1)'
         required: false
+        default: ''
+      game_lang:
+        description: 'Idioma nativo preconfigurado en el .ipa'
+        type: choice
+        options:
+          - es-419
+          - es
+          - en-US
+        default: 'es-419'
 
 concurrency:
-  group: nxnative-ipa-builder
+  group: nxnative-ipa-builder-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  # Elimina el warning de deprecación de Node.js 20 en GitHub Actions (2026)
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Optimización extrema de Homebrew y .NET CLI (Cero auto-updates ni telemetría)
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_ANALYTICS: 1
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: 1
+  PYTHONUNBUFFERED: 1
+  WORK_DIR: /Users/runner/Games/MiJuego
+  KEYS_DIR: /Users/runner/keys
 
 jobs:
   build-ipa:
     runs-on: macos-15
     timeout-minutes: 300
-    env:
-      WORK_DIR: /Users/runner/Games/MiJuego
-      KEYS_DIR: /Users/runner/keys
 
     steps:
-      - name: 1. Checkout del repositorio
+      - name: 1. Checkout del motor NXNative
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: 2. Auditoría de Entorno, Parcheo Quirúrgico y Test Fail-Fast (15s)
+      - name: 2. Liberación Agresiva de Disco y Auditoría Fail-Fast de Xcode
+        env:
+          TARGET_LANG: ${{ inputs.game_lang }}
         run: |
           set -euo pipefail
-          echo "=== 1. Seleccionando el Xcode más reciente disponible ==="
+          echo "::group::Liberando espacio en el SSD del Runner"
+          # Eliminamos SDKs de Android en macOS que no usamos para ganar +20 GB de margen
+          rm -rf /Users/runner/Library/Android &
+          echo "::endgroup::"
+
+          echo "::group::Selección de Toolchain y Parcheo AST/UI"
           LATEST_XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
           sudo xcode-select -s "$LATEST_XCODE"
           xcodebuild -version
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           SDK_VER=$(xcrun --sdk iphoneos --show-sdk-version)
-          echo "SDK iOS detectado: $SDK_VER ($SDK_PATH)"
+          echo "✓ Xcode activo: $LATEST_XCODE (iOS SDK $SDK_VER)"
 
-          echo "=== 2. Parcheo quirúrgico para compatibilidad de SDK (< 26.0) ==="
           if ! xcodebuild -version | grep -q "Xcode 26"; then
-            # Reemplazar estilos exclusivos de iOS 26 Liquid Glass en SwiftUI
-            sed -i '' 's/\.buttonStyle(\.glassProminent)/\.buttonStyle(\.borderedProminent)/g' dm/ios/Sources/Launcher.swift
-            sed -i '' 's/\.buttonStyle(\.glass)/\.buttonStyle(\.bordered)/g' dm/ios/Sources/Launcher.swift
-            sed -i '' 's/\.glassProminent/\.borderedProminent/g' dm/ios/Sources/Launcher.swift
-            
-            # Ajustar únicamente el Deployment Target de iOS (sin tocar constantes numéricas del motor)
+            # 1. Parchear APIs exclusivas de Liquid Glass (iOS 26) hacia equivalentes estables
+            find dm/ios/ -name "*.swift" -exec sed -i '' \
+              -e 's/\.buttonStyle(\.glassProminent)/\.buttonStyle(\.borderedProminent)/g' \
+              -e 's/\.buttonStyle(\.glass)/\.buttonStyle(\.bordered)/g' \
+              -e 's/\.glassProminent/\.borderedProminent/g' {} +
+
+            # 2. Alinear Deployment Target al SDK real instalado en el runner
             find dm/ scripts/ -type f \( -name "*.yml" -o -name "*.py" -o -name "*.sh" \) \
-              -exec sed -i '' 's/iOS: "26\.0"/iOS: "18.0"/g; s/iOS: 26\.0/iOS: 18.0/g; s/IPHONEOS_DEPLOYMENT_TARGET=26\.0/IPHONEOS_DEPLOYMENT_TARGET=18.0/g; s/iphoneos26\.0/iphoneos18.0/g' {} +
+              -exec sed -i '' \
+              -e 's/iOS: "26\.0"/iOS: "18.0"/g' \
+              -e 's/iOS: 26\.0/iOS: 18.0/g' \
+              -e 's/IPHONEOS_DEPLOYMENT_TARGET=26\.0/IPHONEOS_DEPLOYMENT_TARGET=18.0/g' \
+              -e 's/iphoneos26\.0/iphoneos18.0/g' {} +
           fi
 
-          echo "=== 3. PREFLIGHT FAIL-FAST: Compilando Launcher.swift en seco ==="
-          # Validamos en 5 segundos que Launcher.swift compile sin errores contra el SDK actual
-          # antes de gastar 2 horas traduciendo shaders.
+          # 3. Inyectar el idioma elegido (ej. es-419) como predeterminado en el empaquetador
+          if [ -n "$TARGET_LANG" ]; then
+            find scripts/ -name "*.py" -exec sed -i '' "s/en-US/$TARGET_LANG/g" {} + || true
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Preflight Fail-Fast (Typecheck de SwiftUI + Clang)"
           xcrun --sdk iphoneos swiftc -typecheck \
             -target arm64-apple-ios18.0 \
             -sdk "$SDK_PATH" \
             dm/ios/Sources/Launcher.swift
-          echo "✓ Preflight superado: Launcher.swift es 100% válido con este Xcode."
+          echo "✓ Validación estática de Swift superada en 0 errores."
+          echo "::endgroup::"
 
-      - name: 3. Instalar Dependencias Nativas y Python
+      - name: 3. Instalar Dependencias con Paralelismo Nativo
         run: |
           set -euo pipefail
-          brew install xcodegen spirv-cross glslang zstd || true
-          which dotnet || brew install --cask dotnet-sdk
-          python3 -m pip install lz4 capstone fonttools gdown "backports.zstd; python_version < '3.14'" --break-system-packages
+          for pkg in xcodegen spirv-cross glslang zstd; do
+            brew list "$pkg" &>/dev/null || brew install --quiet "$pkg"
+          done
+          which dotnet &>/dev/null || brew install --cask --quiet dotnet-sdk
+          python3 -m pip install --quiet --disable-pip-version-check \
+            lz4 capstone fonttools gdown "backports.zstd; python_version < '3.14'" \
+            --break-system-packages
 
-      - name: 4. Inyectar y Validar prod.keys
+      - name: 4. Validar Criptografía (prod.keys)
         env:
           SECRET_KEYS: ${{ secrets.PROD_KEYS }}
         run: |
           set -euo pipefail
           mkdir -p "$KEYS_DIR" "$WORK_DIR"
           if [ -n "$SECRET_KEYS" ]; then
-            echo "$SECRET_KEYS" > "$KEYS_DIR/prod.keys"
+            printf "%s\n" "$SECRET_KEYS" > "$KEYS_DIR/prod.keys"
           elif [ -f "prod.keys" ]; then
             cp prod.keys "$KEYS_DIR/prod.keys"
           else
-            echo "::error::No se encontró prod.keys ni en GitHub Secrets ni en la raíz del repo."
+            echo "::error::Falta prod.keys (ni en Secrets ni en el repo)."
             exit 1
           fi
-          if ! grep -q "header_key" "$KEYS_DIR/prod.keys"; then
-            echo "::error::El archivo prod.keys no contiene 'header_key'. Verifica que esté completo."
-            exit 1
-          fi
-          echo "✓ prod.keys validado correctamente."
+          # Limpiar posibles retornos de carro Windows (\r\n) que rompen el parser de LibHac
+          tr -d '\r' < "$KEYS_DIR/prod.keys" > "$KEYS_DIR/prod.keys.clean"
+          mv "$KEYS_DIR/prod.keys.clean" "$KEYS_DIR/prod.keys"
 
-      - name: 5. Restaurar Caché de Shaders y Extracción
+          for req_key in "header_key" "aes_kek_generation_source" "key_area_key_application_00"; do
+            if ! grep -q "$req_key" "$KEYS_DIR/prod.keys"; then
+              echo "::error::prod.keys corrupto o incompleto: falta '$req_key'."
+              exit 1
+            fi
+          done
+          echo "✓ Criptografía validada (formato LF limpio)."
+
+      - name: 5. Restaurar Caché Multinivel (Shaders Metal + Binarios Rewritten)
         uses: actions/cache/restore@v4
         with:
           path: |
             /Users/runner/Games/MiJuego/*_build/shader
             /Users/runner/Games/MiJuego/*_build/rewrite
-          key: nxnative-cache-${{ github.run_id }}
+            /Users/runner/Games/MiJuego/*_build/profile
+          key: nxnative-metal-v2-${{ github.run_id }}
           restore-keys: |
+            nxnative-metal-v2-
             nxnative-cache-
 
-      - name: 6. Descargar y Verificar Integridad del .nsp
+      - name: 6. Descarga Segura y Verificación de Firma Hexadecimal (PFS0)
+        env:
+          NSP_URL: ${{ inputs.nsp_url }}
+          UPD_URL: ${{ inputs.update_nsp_url }}
         run: |
           set -euo pipefail
-          URL="${{ github.event.inputs.nsp_url }}"
-          if [[ "$URL" == *"drive.google.com"* ]]; then
-            DRIVE_ID=$(echo "$URL" | sed -n 's/.*\/d\/\([^\/]*\).*/\1/p')
-            python3 -m gdown "${DRIVE_ID:-$URL}" -O "$WORK_DIR/game.nsp"
-          else
-            curl -fL --retry 3 "$URL" -o "$WORK_DIR/game.nsp"
+          download_nsp() {
+            local url="$1"
+            local out="$2"
+            if [[ "$url" == *"drive.google.com"* ]]; then
+              local drive_id
+              drive_id=$(echo "$url" | sed -n 's/.*\/d\/\([^\/?]*\).*/\1/p')
+              python3 -m gdown "${drive_id:-$url}" -O "$out"
+            else
+              curl -fL --retry 5 --retry-delay 5 "$url" -o "$out"
+            fi
+
+            # Verificar Magic Bytes: Todo archivo .nsp legítimo empieza con "PFS0" (Hex: 50465330)
+            local magic
+            magic=$(xxd -p -l 4 "$out")
+            if [ "$magic" != "50465330" ]; then
+              echo "::error::El archivo descargado ($out) NO es un contenedor .nsp válido (Magic bytes: $magic, esperado: 50465330 - PFS0). Verifica que no sea un .zip/.rar o un bloqueo de Google Drive."
+              head -c 300 "$out" || true
+              exit 1
+            fi
+            echo "✓ Firma binaria PFS0 verificada para $out ($(du -h "$out" | cut -f1))"
+          }
+
+          download_nsp "$NSP_URL" "$WORK_DIR/base_game.nsp"
+          if [ -n "$UPD_URL" ]; then
+            download_nsp "$UPD_URL" "$WORK_DIR/update_game.nsp"
           fi
 
-          # Verificar que no se haya descargado un HTML de error de Google Drive (cuota excedida)
-          FILE_SIZE=$(stat -f%z "$WORK_DIR/game.nsp")
-          echo "Tamaño descargado: $FILE_SIZE bytes"
-          if [ "$FILE_SIZE" -lt 10000000 ]; then
-            echo "::error::El archivo descargado pesa menos de 10MB. Google Drive pudo bloquear la descarga por límite de cuota."
-            head -n 20 "$WORK_DIR/game.nsp" || true
-            exit 1
-          fi
-
-      - name: 7. Compilar .nsp a .ipa (Recompilación AOT + Shaders + XcodeBuild)
+      - name: 7. Recompilación AOT, Shaders Metal y Empaquetado IPA
         run: |
           set -o pipefail
+          wait # Esperar a que termine el borrado de Android en background si seguía corriendo
+          df -h
           if ! python3 scripts/build_ipa_from_nsp.py "$WORK_DIR" -k "$KEYS_DIR/prod.keys"; then
-            echo "::error::Fallo durante build_ipa_from_nsp.py. Imprimiendo logs detallados de diagnóstico:"
-            echo "================ BUILD_IPA.LOG ================"
-            cat "$WORK_DIR"/*_build/logs/build_ipa.log || true
-            echo "================ XCODEBUILD PKG LOG ================"
-            cat "$WORK_DIR"/*_build/ipa/build/ios/pkg/build.log || true
+            echo "::error::Fallo en la tubería de compilación. Volcando trazas:"
+            tail -n 120 "$WORK_DIR"/*_build/logs/build_ipa.log || true
+            tail -n 120 "$WORK_DIR"/*_build/ipa/build/ios/pkg/build.log || true
             exit 1
           fi
+          rm -f "$WORK_DIR"/*.nsp
 
-          # Liberar el archivo .nsp crudo para ahorrar 5.3 GB de disco antes de subir el artefacto
-          rm -f "$WORK_DIR/game.nsp"
-          df -h
-
-      - name: 8. Guardar Caché de Shaders (Persistencia ante fallos o re-builds)
+      - name: 8. Persistir Caché de Shaders Metal (Ejecución Garantizada)
         uses: actions/cache/save@v4
         if: always()
         with:
           path: |
             /Users/runner/Games/MiJuego/*_build/shader
             /Users/runner/Games/MiJuego/*_build/rewrite
-          key: nxnative-cache-${{ github.run_id }}
+            /Users/runner/Games/MiJuego/*_build/profile
+          key: nxnative-metal-v2-${{ github.run_id }}
 
-      - name: 9. Publicar Artefacto .ipa para iPhone 17
+      - name: 9. Publicar IPA y Generar Reporte Ejecutivo
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: SuperMarioOdyssey-iOS-IPA
+          name: NXNative-iPhone17-IPA
           path: /Users/runner/Games/MiJuego/*.ipa
           compression-level: 0
           retention-days: 7
+
+      - name: 10. Resumen de Telemetría del Build
+        if: always()
+        run: |
+          {
+            echo "## 📱 Reporte de Compilación NXNative (iPhone 17)"
+            if ls "$WORK_DIR"/*.ipa &>/dev/null; then
+              IPA_FILE=$(ls "$WORK_DIR"/*.ipa | head -n 1)
+              IPA_SIZE=$(du -h "$IPA_FILE" | cut -f1)
+              IPA_SHA=$(shasum -a 256 "$IPA_FILE" | cut -d' ' -f1)
+              echo "- **Estado:** ✅ Éxito Total"
+              echo "- **Archivo Generado:** \`$(basename "$IPA_FILE")\`"
+              echo "- **Tamaño Final:** \`$IPA_SIZE\`"
+              echo "- **Idioma Preconfigurado:** \`${{ inputs.game_lang }}\`"
+              echo "- **SHA-256:** \`$IPA_SHA\`"
+            else
+              echo "- **Estado:** ❌ Falló o fue cancelado (pero los Shaders compilados se guardaron en Caché)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
