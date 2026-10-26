@@ -14,6 +14,19 @@ jobs:
       - name: Descargar código del repositorio
         uses: actions/checkout@v4
 
+      - name: Seleccionar el Xcode más reciente y parchear compatibilidad SDK
+        run: |
+          # Selecciona la versión más nueva de Xcode instalada en el runner
+          LATEST_XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
+          echo "Usando Xcode: $LATEST_XCODE"
+          sudo xcode-select -s "$LATEST_XCODE"
+          xcodebuild -version
+          
+          # Si el runner tiene un SDK anterior a iOS 26, cambia .glassProminent por .borderedProminent
+          if ! xcodebuild -version | grep -q "Xcode 26"; then
+            sed -i '' 's/\.glassProminent/\.borderedProminent/g' dm/ios/Sources/Launcher.swift
+          fi
+
       - name: Instalar herramientas de macOS
         run: |
           brew install xcodegen spirv-cross glslang
@@ -34,11 +47,16 @@ jobs:
             exit 1
           fi
 
+      - name: Restaurar caché de Shaders (ahorra 2 horas en futuros intentos)
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/Games/MiJuego/*_build/shader
+          key: nxnative-shaders-odyssey-v1
+
       - name: Descargar el juego (.nsp)
         run: |
           URL="${{ github.event.inputs.nsp_url }}"
           if [[ "$URL" == *"drive.google.com"* ]]; then
-            # Extrae el identificador del archivo automáticamente desde el link de Drive
             DRIVE_ID=$(echo "$URL" | sed -n 's/.*\/d\/\([^\/]*\).*/\1/p')
             if [ -n "$DRIVE_ID" ]; then
               python3 -m gdown "$DRIVE_ID" -O ~/Games/MiJuego/game.nsp
@@ -54,8 +72,15 @@ jobs:
         run: |
           python3 scripts/build_ipa_from_nsp.py ~/Games/MiJuego -k ~/keys/prod.keys
 
+      - name: Guardar caché de Shaders
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/Games/MiJuego/*_build/shader
+          key: nxnative-shaders-odyssey-v1
+
       - name: Guardar el .ipa terminado
         uses: actions/upload-artifact@v4
         with:
-          name: Juego-iOS-IPA
+          name: SuperMarioOdyssey-IPA
           path: ~/Games/MiJuego/*.ipa
