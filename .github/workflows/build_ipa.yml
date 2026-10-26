@@ -1,86 +1,150 @@
-name: Build NXNative IPA
+name: Build NXNative IPA (Production Grade)
 
 on:
   workflow_dispatch:
     inputs:
       nsp_url:
-        description: 'Enlace de Google Drive o descarga directa de tu juego (.nsp)'
+        description: 'URL de Google Drive o enlace directo del archivo .nsp'
         required: true
+      game_lang:
+        description: 'Idioma por defecto del juego (ej. es-419, es, en-US)'
+        default: 'es-419'
+        required: false
+
+concurrency:
+  group: nxnative-ipa-builder
+  cancel-in-progress: true
 
 jobs:
   build-ipa:
     runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      WORK_DIR: /Users/runner/Games/MiJuego
+      KEYS_DIR: /Users/runner/keys
+
     steps:
-      - name: Descargar código del repositorio
+      - name: 1. Checkout del repositorio
         uses: actions/checkout@v4
 
-      - name: Seleccionar el Xcode más reciente y parchear compatibilidad SDK
+      - name: 2. Auditoría de Entorno, Parcheo Quirúrgico y Test Fail-Fast (15s)
         run: |
-          # Selecciona la versión más nueva de Xcode instalada en el runner
+          set -euo pipefail
+          echo "=== 1. Seleccionando el Xcode más reciente disponible ==="
           LATEST_XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
-          echo "Usando Xcode: $LATEST_XCODE"
           sudo xcode-select -s "$LATEST_XCODE"
           xcodebuild -version
-          
-          # Si el runner tiene un SDK anterior a iOS 26, cambia .glassProminent por .borderedProminent
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          SDK_VER=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "SDK iOS detectado: $SDK_VER ($SDK_PATH)"
+
+          echo "=== 2. Parcheo quirúrgico para compatibilidad de SDK (< 26.0) ==="
           if ! xcodebuild -version | grep -q "Xcode 26"; then
+            # Reemplazar estilos exclusivos de iOS 26 Liquid Glass en SwiftUI
+            sed -i '' 's/\.buttonStyle(\.glassProminent)/\.buttonStyle(\.borderedProminent)/g' dm/ios/Sources/Launcher.swift
+            sed -i '' 's/\.buttonStyle(\.glass)/\.buttonStyle(\.bordered)/g' dm/ios/Sources/Launcher.swift
             sed -i '' 's/\.glassProminent/\.borderedProminent/g' dm/ios/Sources/Launcher.swift
+            
+            # Ajustar únicamente el Deployment Target de iOS (sin tocar constantes numéricas del motor)
+            find dm/ scripts/ -type f \( -name "*.yml" -o -name "*.py" -o -name "*.sh" \) \
+              -exec sed -i '' 's/iOS: "26\.0"/iOS: "18.0"/g; s/iOS: 26\.0/iOS: 18.0/g; s/IPHONEOS_DEPLOYMENT_TARGET=26\.0/IPHONEOS_DEPLOYMENT_TARGET=18.0/g; s/iphoneos26\.0/iphoneos18.0/g' {} +
           fi
 
-      - name: Instalar herramientas de macOS
-        run: |
-          brew install xcodegen spirv-cross glslang
-          brew install --cask dotnet-sdk
-          pip3 install lz4 capstone fonttools gdown "backports.zstd; python_version < '3.14'" --break-system-packages
+          echo "=== 3. PREFLIGHT FAIL-FAST: Compilando Launcher.swift en seco ==="
+          # Validamos en 5 segundos que Launcher.swift compile sin errores contra el SDK actual
+          # antes de gastar 2 horas traduciendo shaders.
+          xcrun --sdk iphoneos swiftc -typecheck \
+            -target arm64-apple-ios18.0 \
+            -sdk "$SDK_PATH" \
+            dm/ios/Sources/Launcher.swift
+          echo "✓ Preflight superado: Launcher.swift es 100% válido con este Xcode."
 
-      - name: Preparar prod.keys
+      - name: 3. Instalar Dependencias Nativas y Python
+        run: |
+          set -euo pipefail
+          brew install xcodegen spirv-cross glslang zstd || true
+          which dotnet || brew install --cask dotnet-sdk
+          python3 -m pip install lz4 capstone fonttools gdown "backports.zstd; python_version < '3.14'" --break-system-packages
+
+      - name: 4. Inyectar y Validar prod.keys
         env:
           SECRET_KEYS: ${{ secrets.PROD_KEYS }}
         run: |
-          mkdir -p ~/keys ~/Games/MiJuego
+          set -euo pipefail
+          mkdir -p "$KEYS_DIR" "$WORK_DIR"
           if [ -n "$SECRET_KEYS" ]; then
-            echo "$SECRET_KEYS" > ~/keys/prod.keys
+            echo "$SECRET_KEYS" > "$KEYS_DIR/prod.keys"
           elif [ -f "prod.keys" ]; then
-            cp prod.keys ~/keys/prod.keys
+            cp prod.keys "$KEYS_DIR/prod.keys"
           else
-            echo "Error: No se encontró prod.keys"
+            echo "::error::No se encontró prod.keys ni en GitHub Secrets ni en la raíz del repo."
             exit 1
           fi
+          if ! grep -q "header_key" "$KEYS_DIR/prod.keys"; then
+            echo "::error::El archivo prod.keys no contiene 'header_key'. Verifica que esté completo."
+            exit 1
+          fi
+          echo "✓ prod.keys validado correctamente."
 
-      - name: Restaurar caché de Shaders (ahorra 2 horas en futuros intentos)
+      - name: 5. Restaurar Caché de Shaders y Extracción
         uses: actions/cache/restore@v4
         with:
-          path: ~/Games/MiJuego/*_build/shader
-          key: nxnative-shaders-odyssey-v1
+          path: |
+            /Users/runner/Games/MiJuego/*_build/shader
+            /Users/runner/Games/MiJuego/*_build/rewrite
+          key: nxnative-cache-${{ github.run_id }}
+          restore-keys: |
+            nxnative-cache-
 
-      - name: Descargar el juego (.nsp)
+      - name: 6. Descargar y Verificar Integridad del .nsp
         run: |
+          set -euo pipefail
           URL="${{ github.event.inputs.nsp_url }}"
           if [[ "$URL" == *"drive.google.com"* ]]; then
             DRIVE_ID=$(echo "$URL" | sed -n 's/.*\/d\/\([^\/]*\).*/\1/p')
-            if [ -n "$DRIVE_ID" ]; then
-              python3 -m gdown "$DRIVE_ID" -O ~/Games/MiJuego/game.nsp
-            else
-              python3 -m gdown "$URL" -O ~/Games/MiJuego/game.nsp
-            fi
+            python3 -m gdown "${DRIVE_ID:-$URL}" -O "$WORK_DIR/game.nsp"
           else
-            curl -L "$URL" -o ~/Games/MiJuego/game.nsp
+            curl -fL --retry 3 "$URL" -o "$WORK_DIR/game.nsp"
           fi
-          ls -lh ~/Games/MiJuego/
 
-      - name: Convertir .nsp a .ipa
+          # Verificar que no se haya descargado un HTML de error de Google Drive (cuota excedida)
+          FILE_SIZE=$(stat -f%z "$WORK_DIR/game.nsp")
+          echo "Tamaño descargado: $FILE_SIZE bytes"
+          if [ "$FILE_SIZE" -lt 10000000 ]; then
+            echo "::error::El archivo descargado pesa menos de 10MB. Google Drive pudo bloquear la descarga por límite de cuota."
+            head -n 20 "$WORK_DIR/game.nsp" || true
+            exit 1
+          fi
+
+      - name: 7. Compilar .nsp a .ipa (Recompilación AOT + Shaders + XcodeBuild)
         run: |
-          python3 scripts/build_ipa_from_nsp.py ~/Games/MiJuego -k ~/keys/prod.keys
+          set -o pipefail
+          if ! python3 scripts/build_ipa_from_nsp.py "$WORK_DIR" -k "$KEYS_DIR/prod.keys"; then
+            echo "::error::Fallo durante build_ipa_from_nsp.py. Imprimiendo logs detallados de diagnóstico:"
+            echo "================ BUILD_IPA.LOG ================"
+            cat "$WORK_DIR"/*_build/logs/build_ipa.log || true
+            echo "================ XCODEBUILD PKG LOG ================"
+            cat "$WORK_DIR"/*_build/ipa/build/ios/pkg/build.log || true
+            exit 1
+          fi
 
-      - name: Guardar caché de Shaders
+          # Liberar el archivo .nsp crudo para ahorrar 5.3 GB de disco antes de subir el artefacto
+          rm -f "$WORK_DIR/game.nsp"
+          df -h
+
+      - name: 8. Guardar Caché de Shaders (Persistencia ante fallos o re-builds)
         uses: actions/cache/save@v4
         if: always()
         with:
-          path: ~/Games/MiJuego/*_build/shader
-          key: nxnative-shaders-odyssey-v1
+          path: |
+            /Users/runner/Games/MiJuego/*_build/shader
+            /Users/runner/Games/MiJuego/*_build/rewrite
+          key: nxnative-cache-${{ github.run_id }}
 
-      - name: Guardar el .ipa terminado
+      - name: 9. Publicar Artefacto .ipa para iPhone 17
         uses: actions/upload-artifact@v4
         with:
-          name: SuperMarioOdyssey-IPA
-          path: ~/Games/MiJuego/*.ipa
+          name: SuperMarioOdyssey-iOS-IPA
+          path: /Users/runner/Games/MiJuego/*.ipa
+          compression-level: 0
+          retention-days: 7
