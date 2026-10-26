@@ -186,7 +186,6 @@ jobs:
         run: |
           set -o pipefail
           wait
-          df -h
           if ! python3 scripts/build_ipa_from_nsp.py "$WORK_DIR" -k "$KEYS_DIR/prod.keys"; then
             echo "::error::Fallo en la tubería de compilación. Volcando trazas:"
             tail -n 120 "$WORK_DIR"/*_build/logs/build_ipa.log || true
