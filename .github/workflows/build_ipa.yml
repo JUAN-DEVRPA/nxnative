@@ -3,9 +3,13 @@ name: Build NXNative IPA (Staff Engineer Edition)
 on:
   workflow_dispatch:
     inputs:
-      nsp_url:
-        description: 'URL de la Carpeta de Google Drive con el juego y el update'
+      base_nsp_url:
+        description: 'URL de Google Drive del Juego Base (.nsp)'
         required: true
+      update_nsp_url:
+        description: '(Opcional) URL de Google Drive del Update (.nsp)'
+        required: false
+        default: ''
       game_lang:
         description: 'Idioma nativo preconfigurado en el .ipa'
         type: choice
@@ -133,34 +137,42 @@ jobs:
             nxnative-metal-v2-
             nxnative-cache-
 
-      - name: 6. Descarga Masiva de la Carpeta de Google Drive y Auditoría NSP
+      - name: 6. Descarga Segura de Archivos .nsp Individuales
         env:
-          DRIVE_URL: ${{ inputs.nsp_url }}
+          BASE_URL: ${{ inputs.base_nsp_url }}
+          UPD_URL: ${{ inputs.update_nsp_url }}
         run: |
           set -euo pipefail
-          echo "Descargando carpeta completa de Google Drive..."
-          python3 -m gdown --folder "$DRIVE_URL" -O "$WORK_DIR/"
+          download_file() {
+            local url="$1"
+            local out="$2"
+            if [[ "$url" == *"drive.google.com"* ]]; then
+              local file_id
+              file_id=$(echo "$url" | sed -n 's/.*\/d\/\([^\/?]*\).*/\1/p')
+              python3 -m gdown "${file_id:-$url}" -O "$out"
+            else
+              curl -fL --retry 5 --retry-delay 5 "$url" -o "$out"
+            fi
 
-          # Mover los .nsp por si se descargaron dentro de una subcarpeta
-          find "$WORK_DIR" -type f -name "*.nsp" -exec mv {} "$WORK_DIR/" \;
+            local magic
+            magic=$(xxd -p -l 4 "$out")
+            if [ "$magic" != "50465330" ]; then
+              echo "::error::El archivo descargado ($out) no es un contenedor .nsp válido (Magic: $magic). Asegúrate de que el enlace de Google Drive sea de un archivo individual y tenga permisos públicos."
+              head -c 300 "$out" || true
+              exit 1
+            fi
+            echo "✓ Archivo verificado correctamente: $(basename "$out") ($(du -h "$out" | cut -f1))"
+          }
 
-          echo "Archivos .nsp encontrados en la zona de trabajo:"
+          echo "Descargando juego base..."
+          download_file "$BASE_URL" "$WORK_DIR/base_game.nsp"
+
+          if [ -n "$UPD_URL" ]; then
+            echo "Descargando actualización (update)..."
+            download_file "$UPD_URL" "$WORK_DIR/update_game.nsp"
+          fi
+
           ls -lh "$WORK_DIR"/*.nsp
-
-          # Validar que al menos exista el juego base
-          BASE_GAME=$(ls "$WORK_DIR"/*[v0]*.nsp 2>/dev/null || ls "$WORK_DIR"/*.nsp | head -n 1)
-          if [ -z "$BASE_GAME" ]; then
-            echo "::error::No se encontró ningún archivo .nsp válido en la carpeta descargada."
-            exit 1
-          fi
-
-          # Verificar Magic Bytes (PFS0) en el archivo base
-          MAGIC=$(xxd -p -l 4 "$BASE_GAME")
-          if [ "$MAGIC" != "50465330" ]; then
-            echo "::error::El archivo principal no es un contenedor .nsp válido (Magic: $MAGIC)."
-            exit 1
-          fi
-          echo "✓ Contenedor .nsp base verificado correctamente."
 
       - name: 7. Recompilación AOT, Shaders Metal y Empaquetado IPA
         run: |
