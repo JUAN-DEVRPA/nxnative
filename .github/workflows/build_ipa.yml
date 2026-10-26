@@ -89,13 +89,18 @@ jobs:
           echo "✓ Validación estática de Swift superada en 0 errores."
           echo "::endgroup::"
 
-      - name: 3. Instalar Dependencias con Paralelismo Nativo
+      - name: 3. Instalar Dependencias con Paralelismo Nativo y .NET Link
         run: |
           set -euo pipefail
           for pkg in xcodegen spirv-cross glslang zstd; do
             brew list "$pkg" &>/dev/null || brew install --quiet "$pkg"
           done
           which dotnet &>/dev/null || brew install --cask --quiet dotnet-sdk
+          
+          # Enlace simbólico de .NET para que nx_extract lo encuentre sin error 131
+          sudo mkdir -p /usr/local/share/dotnet
+          sudo ln -sfn /opt/homebrew/share/dotnet/* /usr/local/share/dotnet/ 2>/dev/null || true
+          
           python3 -m pip install --quiet --disable-pip-version-check \
             lz4 capstone fonttools gdown "backports.zstd; python_version < '3.14'" \
             --break-system-packages
@@ -175,6 +180,9 @@ jobs:
           ls -lh "$WORK_DIR"/*.nsp
 
       - name: 7. Recompilación AOT, Shaders Metal y Empaquetado IPA
+        env:
+          DOTNET_ROOT: /opt/homebrew/share/dotnet
+          PATH: /opt/homebrew/share/dotnet:$PATH
         run: |
           set -o pipefail
           wait
@@ -182,7 +190,7 @@ jobs:
           if ! python3 scripts/build_ipa_from_nsp.py "$WORK_DIR" -k "$KEYS_DIR/prod.keys"; then
             echo "::error::Fallo en la tubería de compilación. Volcando trazas:"
             tail -n 120 "$WORK_DIR"/*_build/logs/build_ipa.log || true
-            tail -n 120 "$WORK_DIR"/*_build/ipa/build/ios/pkg/build.log || true
+            tail -n 120 "$WORK_DIR"/*_build/logs/*.log || true
             exit 1
           fi
           rm -f "$WORK_DIR"/*.nsp
