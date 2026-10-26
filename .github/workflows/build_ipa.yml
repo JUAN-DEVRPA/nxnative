@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       nsp_url:
-        description: 'URL de descarga directa de tu juego (.nsp) o ID de Google Drive'
+        description: 'Enlace de Google Drive o descarga directa de tu juego (.nsp)'
         required: true
 
 jobs:
@@ -14,13 +14,13 @@ jobs:
       - name: Descargar código del repositorio
         uses: actions/checkout@v4
 
-      - name: Instalar dependencias en macOS
+      - name: Instalar herramientas de macOS
         run: |
-          brew install xcodegen zstd spirv-cross glslang
+          brew install xcodegen spirv-cross glslang
           brew install --cask dotnet-sdk
-          pip3 install lz4 capstone fonttools backports.zstd gdown --break-system-packages
+          pip3 install lz4 capstone fonttools gdown "backports.zstd; python_version < '3.14'" --break-system-packages
 
-      - name: Configurar prod.keys
+      - name: Preparar prod.keys
         env:
           SECRET_KEYS: ${{ secrets.PROD_KEYS }}
         run: |
@@ -30,24 +30,24 @@ jobs:
           elif [ -f "prod.keys" ]; then
             cp prod.keys ~/keys/prod.keys
           else
-            echo "Error: No se encontró prod.keys ni en Secrets ni en el repo"
+            echo "Error: No se encontró prod.keys"
             exit 1
           fi
 
-      - name: Descargar Juego (.nsp)
+      - name: Descargar el juego (.nsp)
         run: |
           if [[ "${{ github.event.inputs.nsp_url }}" == *"drive.google.com"* ]]; then
-            gdown --fuzzy "${{ github.event.inputs.nsp_url }}" -O ~/Games/MiJuego/game.nsp
+            python3 -m gdown --fuzzy "${{ github.event.inputs.nsp_url }}" -O ~/Games/MiJuego/game.nsp
           else
             curl -L "${{ github.event.inputs.nsp_url }}" -o ~/Games/MiJuego/game.nsp
           fi
           ls -lh ~/Games/MiJuego/
 
-      - name: Compilar el archivo .ipa
+      - name: Convertir .nsp a .ipa
         run: |
           python3 scripts/build_ipa_from_nsp.py ~/Games/MiJuego -k ~/keys/prod.keys
 
-      - name: Subir el .ipa listo para descargar
+      - name: Guardar el .ipa terminado
         uses: actions/upload-artifact@v4
         with:
           name: Juego-iOS-IPA
