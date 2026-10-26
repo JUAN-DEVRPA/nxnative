@@ -4,12 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       nsp_url:
-        description: 'URL de Google Drive o enlace directo del archivo .nsp'
+        description: 'URL de la Carpeta de Google Drive con el juego y el update'
         required: true
-      update_nsp_url:
-        description: '(Opcional) URL del Update .nsp (ej. v1.4.1)'
-        required: false
-        default: ''
       game_lang:
         description: 'Idioma nativo preconfigurado en el .ipa'
         type: choice
@@ -24,9 +20,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Elimina el warning de deprecación de Node.js 20 en GitHub Actions (2026)
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # Optimización extrema de Homebrew y .NET CLI (Cero auto-updates ni telemetría)
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALL_CLEANUP: 1
   HOMEBREW_NO_ANALYTICS: 1
@@ -53,7 +47,6 @@ jobs:
         run: |
           set -euo pipefail
           echo "::group::Liberando espacio en el SSD del Runner"
-          # Eliminamos SDKs de Android en macOS que no usamos para ganar +20 GB de margen
           rm -rf /Users/runner/Library/Android &
           echo "::endgroup::"
 
@@ -66,13 +59,11 @@ jobs:
           echo "✓ Xcode activo: $LATEST_XCODE (iOS SDK $SDK_VER)"
 
           if ! xcodebuild -version | grep -q "Xcode 26"; then
-            # 1. Parchear APIs exclusivas de Liquid Glass (iOS 26) hacia equivalentes estables
             find dm/ios/ -name "*.swift" -exec sed -i '' \
               -e 's/\.buttonStyle(\.glassProminent)/\.buttonStyle(\.borderedProminent)/g' \
               -e 's/\.buttonStyle(\.glass)/\.buttonStyle(\.bordered)/g' \
               -e 's/\.glassProminent/\.borderedProminent/g' {} +
 
-            # 2. Alinear Deployment Target al SDK real instalado en el runner
             find dm/ scripts/ -type f \( -name "*.yml" -o -name "*.py" -o -name "*.sh" \) \
               -exec sed -i '' \
               -e 's/iOS: "26\.0"/iOS: "18.0"/g' \
@@ -81,7 +72,6 @@ jobs:
               -e 's/iphoneos26\.0/iphoneos18.0/g' {} +
           fi
 
-          # 3. Inyectar el idioma elegido (ej. es-419) como predeterminado en el empaquetador
           if [ -n "$TARGET_LANG" ]; then
             find scripts/ -name "*.py" -exec sed -i '' "s/en-US/$TARGET_LANG/g" {} + || true
           fi
@@ -120,7 +110,6 @@ jobs:
             echo "::error::Falta prod.keys (ni en Secrets ni en el repo)."
             exit 1
           fi
-          # Limpiar posibles retornos de carro Windows (\r\n) que rompen el parser de LibHac
           tr -d '\r' < "$KEYS_DIR/prod.keys" > "$KEYS_DIR/prod.keys.clean"
           mv "$KEYS_DIR/prod.keys.clean" "$KEYS_DIR/prod.keys"
 
@@ -144,43 +133,39 @@ jobs:
             nxnative-metal-v2-
             nxnative-cache-
 
-      - name: 6. Descarga Segura y Verificación de Firma Hexadecimal (PFS0)
+      - name: 6. Descarga Masiva de la Carpeta de Google Drive y Auditoría NSP
         env:
-          NSP_URL: ${{ inputs.nsp_url }}
-          UPD_URL: ${{ inputs.update_nsp_url }}
+          DRIVE_URL: ${{ inputs.nsp_url }}
         run: |
           set -euo pipefail
-          download_nsp() {
-            local url="$1"
-            local out="$2"
-            if [[ "$url" == *"drive.google.com"* ]]; then
-              local drive_id
-              drive_id=$(echo "$url" | sed -n 's/.*\/d\/\([^\/?]*\).*/\1/p')
-              python3 -m gdown "${drive_id:-$url}" -O "$out"
-            else
-              curl -fL --retry 5 --retry-delay 5 "$url" -o "$out"
-            fi
+          echo "Descargando carpeta completa de Google Drive..."
+          python3 -m gdown --folder "$DRIVE_URL" -O "$WORK_DIR/"
 
-            # Verificar Magic Bytes: Todo archivo .nsp legítimo empieza con "PFS0" (Hex: 50465330)
-            local magic
-            magic=$(xxd -p -l 4 "$out")
-            if [ "$magic" != "50465330" ]; then
-              echo "::error::El archivo descargado ($out) NO es un contenedor .nsp válido (Magic bytes: $magic, esperado: 50465330 - PFS0). Verifica que no sea un .zip/.rar o un bloqueo de Google Drive."
-              head -c 300 "$out" || true
-              exit 1
-            fi
-            echo "✓ Firma binaria PFS0 verificada para $out ($(du -h "$out" | cut -f1))"
-          }
+          # Mover los .nsp por si se descargaron dentro de una subcarpeta
+          find "$WORK_DIR" -type f -name "*.nsp" -exec mv {} "$WORK_DIR/" \;
 
-          download_nsp "$NSP_URL" "$WORK_DIR/base_game.nsp"
-          if [ -n "$UPD_URL" ]; then
-            download_nsp "$UPD_URL" "$WORK_DIR/update_game.nsp"
+          echo "Archivos .nsp encontrados en la zona de trabajo:"
+          ls -lh "$WORK_DIR"/*.nsp
+
+          # Validar que al menos exista el juego base
+          BASE_GAME=$(ls "$WORK_DIR"/*[v0]*.nsp 2>/dev/null || ls "$WORK_DIR"/*.nsp | head -n 1)
+          if [ -z "$BASE_GAME" ]; then
+            echo "::error::No se encontró ningún archivo .nsp válido en la carpeta descargada."
+            exit 1
           fi
+
+          # Verificar Magic Bytes (PFS0) en el archivo base
+          MAGIC=$(xxd -p -l 4 "$BASE_GAME")
+          if [ "$MAGIC" != "50465330" ]; then
+            echo "::error::El archivo principal no es un contenedor .nsp válido (Magic: $MAGIC)."
+            exit 1
+          fi
+          echo "✓ Contenedor .nsp base verificado correctamente."
 
       - name: 7. Recompilación AOT, Shaders Metal y Empaquetado IPA
         run: |
           set -o pipefail
-          wait # Esperar a que termine el borrado de Android en background si seguía corriendo
+          wait
           df -h
           if ! python3 scripts/build_ipa_from_nsp.py "$WORK_DIR" -k "$KEYS_DIR/prod.keys"; then
             echo "::error::Fallo en la tubería de compilación. Volcando trazas:"
@@ -204,7 +189,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: NXNative-iPhone17-IPA
+          name: SuperMarioOdyssey-iPhone17-IPA
           path: /Users/runner/Games/MiJuego/*.ipa
           compression-level: 0
           retention-days: 7
@@ -224,6 +209,6 @@ jobs:
               echo "- **Idioma Preconfigurado:** \`${{ inputs.game_lang }}\`"
               echo "- **SHA-256:** \`$IPA_SHA\`"
             else
-              echo "- **Estado:** ❌ Falló o fue cancelado (pero los Shaders compilados se guardaron en Caché)"
+              echo "- **Estado:** ❌ Falló o fue cancelado"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
